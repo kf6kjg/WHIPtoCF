@@ -29,7 +29,10 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Threading;
 using System.Threading.Tasks;
+using InWorldz.Data.Assets.Stratus;
+using libWHIPVFS;
 using log4net;
 using log4net.Config;
 using Nini.Config;
@@ -41,8 +44,6 @@ namespace WHIPtoCF {
 		private static readonly string EXECUTABLE_DIRECTORY = Path.GetDirectoryName(Assembly.GetEntryAssembly().CodeBase.Replace("file:/", String.Empty));
 
 		private static readonly string DEFAULT_INI_FILE = "whip2cf.ini";
-
-		private static readonly int DEFAULT_BUFFER_SIZE = 32;
 
 		public static int Main(string[] args) {
 			// Add the arguments supplied when running the application to the configuration
@@ -91,22 +92,176 @@ namespace WHIPtoCF {
 				return 1;
 			}
 
-			// Just write a tool that reads the WHIP DB direct and uses the CF bulk API.
+			try {
+				var task = Execute(configSource);
+				Task.WaitAll(task);
+			}
+			catch (Exception e) {
+				LOG.Fatal("Unhandled error during execution.", e);
+				return 1;
+			}
 
-			// Read the folder list - this gives the DB list.
-
-
-			// Read in the byte arrays from each WHIP DB
-			// if list mode, collect the IDs and dump them to STDOUT
-
-
-			// ...
-
-			// Create the needed folder structure, write the asset files into it, package the .tar.gz or .tar.bz2
-			// https://github.com/adamhathcock/sharpcompress/wiki/API-Examples
-
-			Environment.Exit(0);
 			return 0;
+		}
+
+		private static async Task Execute(IConfigSource configSource) {
+			var startupConfig = configSource.Configs["Startup"];
+			var vfs = new WHIPVFS(startupConfig.GetString("inputWhipDbFolder", string.Empty));
+
+			var taskFactory = new TaskFactory(TaskCreationOptions.LongRunning, TaskContinuationOptions.None);
+
+			var dataBases = vfs.GetDatabases();
+			var assetIndexRecordBuffer = new BlockingCollection<AssetIndexRecord>(4096);
+			var assetIndexRecordBufferFiltered = new BlockingCollection<AssetIndexRecord>(2048);
+			var assetBuffer = new BlockingCollection<StratusAsset>(1024);
+
+			var cfConfig = configSource.Configs["CFSettings"];
+			var username = cfConfig.GetString("Username", string.Empty);
+			var apiKey = cfConfig.GetString("APIKey", string.Empty);
+			var useInternalURL = cfConfig.GetBoolean("UseInternalURL", true);
+			var defaultRegion = cfConfig.GetString("DefaultRegion", string.Empty);
+			var containerPrefix = cfConfig.GetString("ContainerPrefix", string.Empty);
+
+			using (var cloudFiles = new CloudFiles.AssetServer("default", username, apiKey, defaultRegion, useInternalURL, containerPrefix))
+			using (var cts = new CancellationTokenSource()) {
+				var cancellationToken = cts.Token;
+
+				var readAssetIndexRecords = await taskFactory.StartNew(async () => {
+					try {
+						foreach (var db in dataBases) {
+							if (cancellationToken.IsCancellationRequested) {
+								break;
+							}
+
+							using (var indexReader = db.CreateIndexReader(AssetScope.Global)) {
+								var records = await indexReader.GetAllAssetRecordsAsync(cancellationToken);
+
+								foreach (var record in records) {
+									if (cancellationToken.IsCancellationRequested) {
+										break;
+									}
+
+									if (!record.Deleted) { // Deleted records are ignorable.
+										assetIndexRecordBuffer.Add(record, cancellationToken);
+									}
+								}
+							}
+
+							using (var indexReader = db.CreateIndexReader(AssetScope.Local)) {
+								var records = await indexReader.GetAllAssetRecordsAsync(cancellationToken);
+
+								foreach (var record in records) {
+									if (cancellationToken.IsCancellationRequested) {
+										break;
+									}
+
+									if (!record.Deleted) { // Deleted records are ignorable.
+										assetIndexRecordBuffer.Add(record, cancellationToken);
+									}
+								}
+							}
+						}
+					}
+					catch (Exception e) {
+						// If an exception occurs, notify all other pipeline stages.
+						cts.Cancel();
+						if (!(e is OperationCanceledException)) {
+							throw;
+						}
+					}
+					finally {
+						assetIndexRecordBuffer.CompleteAdding();
+					}
+				});
+
+				var filterAssetIndexRecords = taskFactory.StartNew(() => {
+					try {
+						foreach (var assetIndexRecord in assetIndexRecordBuffer.GetConsumingEnumerable()) {
+							if (cancellationToken.IsCancellationRequested) {
+								break;
+							}
+
+							// Check CF for the asset ID.  If it exists, move on.
+							if (!cloudFiles.VerifyAssetIdSync(assetIndexRecord.Id)) {
+								assetIndexRecordBufferFiltered.Add(assetIndexRecord, cancellationToken);
+							}
+						}
+					}
+					catch (Exception e) {
+						// If an exception occurs, notify all other pipeline stages.
+						cts.Cancel();
+						if (!(e is OperationCanceledException)) {
+							throw;
+						}
+					}
+					finally {
+						assetIndexRecordBuffer.CompleteAdding();
+					}
+				});
+
+				var readAssets = await taskFactory.StartNew(async () => {
+					try {
+						foreach (var assetIndexRecord in assetIndexRecordBufferFiltered.GetConsumingEnumerable()) {
+							if (cancellationToken.IsCancellationRequested) {
+								break;
+							}
+
+							var prefix = assetIndexRecord.getPrefix();
+
+							var database = dataBases.First(db => db.Prefix == prefix);
+
+							using (var dataReader = database.CreateDataFileReader(assetIndexRecord.Scope)) {
+								var asset = await dataReader.GetAssetAsync(assetIndexRecord, cancellationToken);
+
+								var stratusAsset = new StratusAsset() {
+									CreateTime = asset.GetCreateTime().DateTime,
+									Data = asset.GetAssetData(),
+									Description = asset.GetDescription(),
+									Id = assetIndexRecord.Id,
+									Local = asset.IsLocal(),
+									Name = asset.GetName(),
+									StorageFlags = 0, // From Halcyon CloudFilesAssetClient.cs::StoreAsset(AssetBase) near line 535: for now we're not going to use compression etc, so set to zero
+									Temporary = asset.IsTemporary(),
+									Type = (sbyte)asset.GetAssetType(),
+								};
+
+								assetBuffer.Add(stratusAsset, cancellationToken);
+							}
+						}
+					}
+					catch (Exception e) {
+						// If an exception occurs, notify all other pipeline stages.
+						cts.Cancel();
+						if (!(e is OperationCanceledException)) {
+							throw;
+						}
+					}
+					finally {
+						assetBuffer.CompleteAdding();
+					}
+				});
+
+				var uploadAssets = taskFactory.StartNew(() => {
+					try {
+						foreach (var asset in assetBuffer.GetConsumingEnumerable()) {
+							if (cancellationToken.IsCancellationRequested) {
+								break;
+							}
+
+							cloudFiles.StoreAssetSync(asset);
+						}
+					}
+					catch (Exception e) {
+						// If an exception occurs, notify all other pipeline stages.
+						cts.Cancel();
+						if (!(e is OperationCanceledException)) {
+							throw;
+						}
+					}
+				});
+
+				Task.WaitAll(readAssetIndexRecords, filterAssetIndexRecords, readAssets, uploadAssets);
+			}
 		}
 
 

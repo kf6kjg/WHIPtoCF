@@ -80,8 +80,6 @@ namespace CloudFiles {
 					ProtoBuf.Serializer.Serialize(memStream, asset);
 					memStream.Position = 0;
 
-					var assetIdStr = asset.Id.ToString();
-
 					var mheaders = GenerateStorageHeaders(asset, memStream);
 
 					WarnIfLongOperation("CreateObject",
