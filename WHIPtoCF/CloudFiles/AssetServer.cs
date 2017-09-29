@@ -24,10 +24,15 @@
 // THE SOFTWARE.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
+using InWorldz.Data.Assets.Stratus;
 using log4net;
 using net.openstack.Core.Domain;
+using net.openstack.Core.Exceptions.Response;
 
 namespace CloudFiles {
 	internal class AssetServer : IDisposable {
@@ -66,6 +71,41 @@ namespace CloudFiles {
 			LOG.Info($"[CF] [{_serverHandle}] CF connection prepared for region '{_defaultRegion}' and prefix '{_containerPrefix}' under user '{_cloudIdentity.Username}'.");
 		}
 
+		public void StoreAssetSync(StratusAsset asset) {
+			if (asset == null) throw new ArgumentNullException(nameof(asset));
+			if (asset.Id == Guid.Empty) throw new ArgumentException("Assets must not have a zero ID");
+
+			using (var memStream = new MemoryStream()) {
+				try {
+					ProtoBuf.Serializer.Serialize(memStream, asset);
+					memStream.Position = 0;
+
+					var assetIdStr = asset.Id.ToString();
+
+					var mheaders = GenerateStorageHeaders(asset, memStream);
+
+					WarnIfLongOperation("CreateObject",
+						() => _provider.CreateObject(
+							GenerateContainerName(asset.Id),
+							memStream,
+							GenerateAssetObjectName(asset.Id),
+							"application/octet-stream",
+							headers: mheaders,
+							useInternalUrl: _useInternalURL,
+							region: _defaultRegion
+						)
+					);
+				}
+				catch (ResponseException e) {
+					if (e.Response.StatusCode == System.Net.HttpStatusCode.PreconditionFailed) {
+						throw new AssetExistsException(asset.Id, e);
+					}
+
+					throw new AssetWriteException(asset.Id, e);
+				}
+			}
+		}
+
 		public bool VerifyAssetIdSync(Guid assetId) {
 			using (var memStream = new MemoryStream()) {
 				try {
@@ -73,8 +113,7 @@ namespace CloudFiles {
 						GenerateContainerName(assetId),
 						GenerateAssetObjectName(assetId),
 						_defaultRegion,
-						_useInternalURL,
-						_cloudIdentity
+						_useInternalURL
 					));
 				}
 				catch {
@@ -102,6 +141,54 @@ namespace CloudFiles {
 		/// <returns></returns>
 		private static string GenerateAssetObjectName(Guid assetId) {
 			return assetId.ToString("N") + ".asset";
+		}
+
+		private Dictionary<string, string> GenerateStorageHeaders(StratusAsset asset, MemoryStream stream) {
+			//the HTTP headers only accept letters and digits
+			var fixedName = new StringBuilder();
+			var appended = false;
+			foreach (var letter in asset.Name) {
+				var c = (char)(0x000000ff & (uint)letter);
+				if (c == 127 || (c < ' ' && c != '\t')) {
+					continue;
+				}
+
+				fixedName.Append(letter);
+				appended = true;
+			}
+
+			if (!appended) {
+				fixedName.Append("empty");
+			}
+
+			var headers = new Dictionary<string, string> {
+				{"ETag", Md5Hash(stream)},
+				{"X-Object-Meta-Temp", asset.Temporary ? "1" : "0"},
+				{"X-Object-Meta-Local", asset.Local ? "1" : "0"},
+				{"X-Object-Meta-Type", asset.Type.ToString()},
+				{"X-Object-Meta-Name", fixedName.ToString()},
+				{"If-None-Match", "*"},
+			};
+
+			stream.Position = 0;
+
+			return headers;
+		}
+
+		private static string Md5Hash(Stream data) {
+			byte[] hash;
+			using (var md5 = MD5.Create()) {
+				hash = md5.ComputeHash(data);
+			}
+			return ByteArrayToHexString(hash);
+		}
+
+		private static string ByteArrayToHexString(byte[] dataMd5) {
+			var sb = new StringBuilder();
+			for (var i = 0; i < dataMd5.Length; i++) {
+				sb.AppendFormat("{0:x2}", dataMd5[i]);
+			}
+			return sb.ToString();
 		}
 
 		private void WarnIfLongOperation(string opName, Action operation) {
