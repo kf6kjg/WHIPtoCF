@@ -73,7 +73,7 @@ namespace libWHIPVFS {
 					await stream.ReadAsync(assetData, 0, assetLength, cancellationToken);
 
 					return new Asset {
-						Data = assetData,
+						RawData = assetData,
 					};
 				}
 			}

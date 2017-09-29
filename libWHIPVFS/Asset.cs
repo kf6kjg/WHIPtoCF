@@ -23,34 +23,144 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 using System;
+using System.Linq;
 using System.Text;
 
 namespace libWHIPVFS {
 	public class Asset {
-		public byte[] Data { get; set; }
+		/// <summary>
+		/// Size of the packet header
+		/// </summary>
+		private const short HEADER_SIZE = 39;
+		/// <summary>
+		/// location of the type tag
+		/// </summary>
+		private const short TYPE_TAG_LOC = 32;
+		/// <summary>
+		/// location of the local tag
+		/// </summary>
+		private const short LOCAL_TAG_LOC = 33;
+		/// <summary>
+		/// Location of the temporary tag
+		/// </summary>
+		private const short TEMPORARY_TAG_LOC = 34;
+		/// <summary>
+		/// Location of the create time tag
+		/// </summary>
+		private const short CREATE_TIME_TAG_LOC = 35;
+		/// <summary>
+		/// Location of the size of the name field
+		/// </summary>
+		private const short NAME_SIZE_TAG_LOC = 39;
 
-		public Guid getUUID() {
-			if (Data == null || Data.Length < 32) {
+		public byte[] RawData { get; set; }
+
+		public Guid GetUUID() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
 				throw new InvalidOperationException("Data has not been set or is incomplete.");
 			}
 
-			return Guid.Parse(Encoding.UTF8.GetString(Data, 0, 32));
+			return Guid.Parse(Encoding.UTF8.GetString(RawData, 0, 32));
 		}
 
-		public bool isLocal() {
-			if (Data == null || Data.Length < 33) {
+		public bool IsLocal() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
 				throw new InvalidOperationException("Data has not been set or is incomplete.");
 			}
 
-			return Data[33] == 1;
+			return RawData[LOCAL_TAG_LOC] == 1;
 		}
 
-		public byte getType() {
-			if (Data == null || Data.Length < 32) {
+		public byte GetAssetType() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
 				throw new InvalidOperationException("Data has not been set or is incomplete.");
 			}
 
-			return Data[32];
+			return RawData[TYPE_TAG_LOC];
+		}
+
+		public bool IsTemporary() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
+				throw new InvalidOperationException("Data has not been set or is incomplete.");
+			}
+
+			return RawData[TEMPORARY_TAG_LOC] == 1;
+		}
+
+		public DateTimeOffset GetCreateTime() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
+				throw new InvalidOperationException("Data has not been set or is incomplete.");
+			}
+			var timestampData = RawData.Skip(CREATE_TIME_TAG_LOC).Take(4).ToArray();
+
+			if (BitConverter.IsLittleEndian) {
+				Array.Reverse(timestampData);
+			}
+
+			var timestamp = BitConverter.ToInt32(timestampData, 0);
+
+			return DateTimeOffset_FromUnixTimeSeconds(timestamp);
+		}
+
+		public string GetName() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
+				throw new InvalidOperationException("Data has not been set or is incomplete.");
+			}
+
+			var nameFieldSize = RawData[NAME_SIZE_TAG_LOC];
+
+			if (nameFieldSize > 0) {
+				return Encoding.UTF8.GetString(RawData, NAME_SIZE_TAG_LOC + 1, nameFieldSize);
+			}
+
+			return string.Empty;
+		}
+
+		public string GetDescription() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
+				throw new InvalidOperationException("Data has not been set or is incomplete.");
+			}
+
+			var nameFieldSize = RawData[NAME_SIZE_TAG_LOC];
+			var descSizeFieldLoc = NAME_SIZE_TAG_LOC + nameFieldSize + 1;
+			var descFieldSize = RawData[descSizeFieldLoc];
+
+			if (descFieldSize > 0) {
+				return Encoding.UTF8.GetString(RawData, descSizeFieldLoc + 1, descFieldSize);
+			}
+
+			return string.Empty;
+		}
+
+		public byte[] GetAssetData() {
+			if (RawData == null || RawData.Length < HEADER_SIZE) {
+				throw new InvalidOperationException("Data has not been set or is incomplete.");
+			}
+
+			var nameFieldSize = RawData[NAME_SIZE_TAG_LOC];
+			var descSizeFieldLoc = NAME_SIZE_TAG_LOC + nameFieldSize + 1;
+			var descFieldSize = RawData[descSizeFieldLoc];
+			var dataSizeFieldLoc = descSizeFieldLoc + descFieldSize + 1;
+
+			var dataSizeRaw = RawData.Skip(dataSizeFieldLoc).Take(4).ToArray();
+			if (BitConverter.IsLittleEndian) {
+				Array.Reverse(dataSizeRaw);
+			}
+			var dataSize = BitConverter.ToInt32(dataSizeRaw, 0);
+			int dataLoc = dataSizeFieldLoc + 4;
+
+			if (dataSize > 0) {
+				return RawData.Skip(dataLoc).Take(dataSize).ToArray();
+			}
+
+			return new byte[0];
+		}
+
+		// Hackyness because I can't have .NET 4.6 due to Mono ;(
+		private static readonly DateTimeOffset epoch = new DateTimeOffset(new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc));
+		private static DateTimeOffset DateTimeOffset_FromUnixTimeSeconds(double unixTimeStamp) {
+			// Unix timestamp is seconds past epoch
+			return epoch.AddSeconds(unixTimeStamp);
 		}
 	}
 }
