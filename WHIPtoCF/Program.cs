@@ -108,10 +108,12 @@ namespace WHIPtoCF {
 			var startupConfig = configSource.Configs["Startup"];
 			var vfs = new WHIPVFS(startupConfig.GetString("inputWhipDbFolder", string.Empty));
 
+			// Using the Pipeline concept: https://msdn.microsoft.com/en-us/library/ff963548.aspx
+
 			var taskFactory = new TaskFactory(TaskCreationOptions.LongRunning, TaskContinuationOptions.None);
 
 			var dataBases = vfs.GetDatabases();
-			var assetIndexRecordBuffer = new BlockingCollection<AssetIndexRecord>(4096);
+			var assetIndexRecordBuffer = new BlockingCollection<AssetIndexRecord>(4096); // Magic numbers that are pure guesswork. See https://msdn.microsoft.com/en-us/library/ff963548.aspx for how to guess them better.
 			var assetIndexRecordBufferFiltered = new BlockingCollection<AssetIndexRecord>(2048);
 			var assetBuffer = new BlockingCollection<StratusAsset>(1024);
 
